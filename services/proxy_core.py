@@ -258,17 +258,7 @@ class HLSProxyCoreMixin:
         for key in expired_keys:
             self.captured_hls_manifest_map.pop(key, None)
 
-        # Derive a stable id from (source_url + manifest tail) when possible, so that
-        # extractors that rotate signed-token URLs (vidxgo, …) keep emitting the
-        # same cm_<id> across refreshes — otherwise the player would see a new
-        # rendition every TTL and restart playback from zero. Use multiple path
-        # parts because VixSrc audio/video variants often share `index.m3u8`.
-        if source_url:
-            path_parts = [part for part in urllib.parse.urlparse(url).path.split("/") if part]
-            suffix = "/".join(path_parts[-3:]) or url
-            stable_key = f"{source_url}|{suffix}"
-        else:
-            stable_key = url
+        stable_key = self._captured_manifest_stable_key(source_url, url)
         url_id = f"cm_{hashlib.md5(stable_key.encode()).hexdigest()[:12]}"
         self.captured_hls_manifest_map[url_id] = (url, manifest, headers, now, ttl, source_url)
         self.hls_url_map[url_id] = (url, now, ttl)
@@ -310,7 +300,10 @@ class HLSProxyCoreMixin:
                             force_refresh=True,
                             background_refresh=True,
                         )
-                        captured_path = urllib.parse.urlparse(captured_url).path
+                        captured_stable_key = self._captured_manifest_stable_key(
+                            entry_source_url,
+                            captured_url,
+                        )
                         refreshed_manifests = list(
                             (refreshed.get("captured_manifests") or {}).items()
                         )
@@ -320,10 +313,10 @@ class HLSProxyCoreMixin:
                                 refreshed.get("captured_manifest"),
                             )]
                         for refreshed_url, refreshed_manifest in reversed(refreshed_manifests):
-                            if refreshed_url and self._segment_paths_match(
-                                captured_path,
-                                urllib.parse.urlparse(refreshed_url).path,
-                            ):
+                            if refreshed_url and self._captured_manifest_stable_key(
+                                entry_source_url,
+                                refreshed_url,
+                            ) == captured_stable_key:
                                 refreshed_headers = refreshed.get("request_headers", captured_headers)
                                 # CRITICAL: bump stored_at so the entry is not
                                 # GC'd by the entry_ttl check above, and so the
@@ -348,6 +341,25 @@ class HLSProxyCoreMixin:
 
             self.captured_hls_refresh_tasks[url_id] = asyncio.create_task(refresh_loop())
         return url_id
+
+    @staticmethod
+    def _captured_manifest_stable_key(source_url: str | None, manifest_url: str) -> str:
+        if not source_url:
+            return manifest_url
+
+        parsed = urllib.parse.urlparse(manifest_url)
+        path_parts = [part for part in parsed.path.split("/") if part]
+        suffix = "/".join(path_parts[-3:]) or manifest_url
+        volatile_params = {"token", "expires", "asn", "edge"}
+        stable_params = [
+            (key, value)
+            for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+            if key.lower() not in volatile_params
+        ]
+        stable_query = urllib.parse.urlencode(stable_params)
+        if stable_query:
+            suffix = f"{suffix}?{stable_query}"
+        return f"{source_url}|{suffix}"
 
     async def start_tasks(self):
         """Starts background tasks for the proxy."""
